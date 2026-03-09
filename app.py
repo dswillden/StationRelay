@@ -459,32 +459,69 @@ def _next_empty_row(sheet, col_index: int) -> int:
 
 
 def _nudge_onedrive(file_path: str) -> None:
-    try:
-        import time
+    """
+    Force OneDrive to notice and upload a change to *file_path*.
 
-        onedrive_root = (os.environ.get("OneDriveCommercial")
-                         or os.environ.get("OneDrive", ""))
-        norm_path = os.path.normcase(os.path.abspath(file_path))
-        norm_root = (os.path.normcase(os.path.abspath(onedrive_root))
-                     if onedrive_root else "")
-        if norm_root and not norm_path.startswith(norm_root):
-            return
+    Strategy: launch a hidden PowerShell process that opens the workbook
+    in a *registered* Excel COM session (not DispatchEx), re-saves it, and
+    closes it.  This is the same as the user pressing Ctrl+S — OneDrive's
+    file-system watcher sees a real write and starts uploading immediately.
 
-        now = datetime.now().timestamp()
-        os.utime(file_path, (now, now))
+    Runs as a fire-and-forget background thread so it never blocks the UI.
+    Falls back to a simple os.utime touch if PowerShell/Excel is unavailable.
+    """
+    import subprocess
+    import threading as _threading
 
-        sidecar = os.path.join(
-            os.path.dirname(file_path),
-            ".stationrelay-sync",
-        )
-        with open(sidecar, "w", encoding="utf-8") as f:
-            f.write(datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"))
-            f.flush()
-            os.fsync(f.fileno())
-        os.utime(sidecar, (now, now))
-        time.sleep(0.1)
-    except Exception:
-        pass
+    abs_path = os.path.normpath(os.path.abspath(file_path))
+
+    # PowerShell script: open Excel invisibly via normal Dispatch (uses the
+    # running Excel registration so OneDrive sees it as a user edit), save,
+    # close, quit.  We use Start-Sleep to give Excel a moment to register
+    # the workbook before saving.
+    ps_script = f"""
+$ErrorActionPreference = 'Stop'
+try {{
+    $xl = New-Object -ComObject Excel.Application
+    $xl.Visible = $false
+    $xl.DisplayAlerts = $false
+    $wb = $xl.Workbooks.Open('{abs_path.replace("'", "''")}', 0, $false)
+    Start-Sleep -Milliseconds 800
+    $wb.Save()
+    $wb.Close($false)
+    $xl.Quit()
+    [System.Runtime.Interopservices.Marshal]::ReleaseComObject($xl) | Out-Null
+}} catch {{
+    exit 1
+}}
+"""
+
+    def _run() -> None:
+        # Acquire the same lock as _com_session so we don't race with a
+        # concurrent write session that already has Excel open.
+        with _EXCEL_SESSION_LOCK:
+            try:
+                subprocess.run(
+                    [
+                        "powershell",
+                        "-NonInteractive",
+                        "-NoProfile",
+                        "-WindowStyle", "Hidden",
+                        "-Command", ps_script,
+                    ],
+                    timeout=30,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception:
+                # Fallback: bare timestamp touch
+                try:
+                    now = datetime.now().timestamp()
+                    os.utime(abs_path, (now, now))
+                except Exception:
+                    pass
+
+    _threading.Thread(target=_run, daemon=True).start()
 
 
 def _com_session(func):
