@@ -1,0 +1,4 @@
+# StationRelay dependencies
+# Tkinter is included with standard Python on Windows — no install needed.
+# pywin32 provides COM automation for Excel.
+pywin32
