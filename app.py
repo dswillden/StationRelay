@@ -23,10 +23,15 @@ Build single EXE:
 
 import json
 import os
+import shutil
+import tempfile
 import threading
 import tkinter as tk
 from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
+
+
+_EXCEL_SESSION_LOCK = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Config
@@ -367,19 +372,62 @@ def get_display_name() -> str:
     return os.environ.get("USERNAME") or os.getlogin()
 
 
-def _open_excel_hidden(excel_path: str):
+def _open_excel_hidden(
+    excel_path: str,
+    read_only: bool = False,
+    kill_conflicts: bool = True,
+):
     """Open *excel_path* in a fresh hidden Excel instance.
 
     Kills any existing Excel process holding the file first to avoid
     write-lock conflicts.
     """
-    _kill_excel_for_file(excel_path)
+    if kill_conflicts:
+        _kill_excel_for_file(excel_path)
     import win32com.client  # type: ignore
     excel = win32com.client.DispatchEx("Excel.Application")
     excel.Visible = False
     excel.DisplayAlerts = False
-    wb = excel.Workbooks.Open(excel_path)
+    try:
+        wb = excel.Workbooks.Open(
+            excel_path,
+            UpdateLinks=0,
+            ReadOnly=read_only,
+            IgnoreReadOnlyRecommended=True,
+            Notify=False,
+            AddToMru=False,
+        )
+    except Exception:
+        try:
+            excel.Quit()
+        except Exception:
+            pass
+        raise
     return excel, wb
+
+
+def _create_excel_snapshot(excel_path: str) -> str:
+    """Copy the workbook to a temp file for read-only queue loading."""
+    import time
+
+    _, ext = os.path.splitext(excel_path)
+    fd, temp_path = tempfile.mkstemp(prefix="stationrelay-", suffix=ext)
+    os.close(fd)
+
+    last_exc = None
+    for _attempt in range(3):
+        try:
+            shutil.copy2(excel_path, temp_path)
+            return temp_path
+        except Exception as exc:
+            last_exc = exc
+            time.sleep(0.75)
+
+    try:
+        os.remove(temp_path)
+    except Exception:
+        pass
+    raise last_exc  # type: ignore[misc]
 
 
 def _get_sheet(wb, sheet_name: str):
@@ -412,6 +460,8 @@ def _next_empty_row(sheet, col_index: int) -> int:
 
 def _nudge_onedrive(file_path: str) -> None:
     try:
+        import time
+
         onedrive_root = (os.environ.get("OneDriveCommercial")
                          or os.environ.get("OneDrive", ""))
         norm_path = os.path.normcase(os.path.abspath(file_path))
@@ -419,8 +469,20 @@ def _nudge_onedrive(file_path: str) -> None:
                      if onedrive_root else "")
         if norm_root and not norm_path.startswith(norm_root):
             return
+
         now = datetime.now().timestamp()
         os.utime(file_path, (now, now))
+
+        sidecar = os.path.join(
+            os.path.dirname(file_path),
+            ".stationrelay-sync",
+        )
+        with open(sidecar, "w", encoding="utf-8") as f:
+            f.write(datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"))
+            f.flush()
+            os.fsync(f.fileno())
+        os.utime(sidecar, (now, now))
+        time.sleep(0.1)
     except Exception:
         pass
 
@@ -436,14 +498,15 @@ def _com_session(func):
     """
     def wrapper(*args, **kwargs):
         import pythoncom  # type: ignore
-        pythoncom.CoInitialize()
-        _filter = _RetryMessageFilter()
-        _filter.register()
-        try:
-            return func(*args, **kwargs)
-        finally:
-            _filter.unregister()
-            pythoncom.CoUninitialize()
+        with _EXCEL_SESSION_LOCK:
+            pythoncom.CoInitialize()
+            _filter = _RetryMessageFilter()
+            _filter.register()
+            try:
+                return func(*args, **kwargs)
+            finally:
+                _filter.unregister()
+                pythoncom.CoUninitialize()
     return wrapper
 
 
@@ -548,6 +611,7 @@ def append_to_excel(excel_path: str, sheet_name: str, column: str, lot: str) -> 
     _nudge_onedrive(excel_path)
 
 
+@_with_retry(max_attempts=3, delay=2.5)
 @_com_session
 def read_from_excel(excel_path: str, sheet_name: str, column: str) -> list:
     """
@@ -555,9 +619,15 @@ def read_from_excel(excel_path: str, sheet_name: str, column: str) -> list:
     Raises on failure — callers must handle the exception and surface it to the user.
     """
     excel = wb = None
+    snapshot_path = None
     rows = []
     try:
-        excel, wb = _open_excel_hidden(excel_path)
+        snapshot_path = _create_excel_snapshot(excel_path)
+        excel, wb = _open_excel_hidden(
+            snapshot_path,
+            read_only=True,
+            kill_conflicts=False,
+        )
         sheet = _get_sheet(wb, sheet_name)
         col = _col_letter_to_index(column)
         used = sheet.UsedRange.Rows.Count
@@ -578,6 +648,9 @@ def read_from_excel(excel_path: str, sheet_name: str, column: str) -> list:
             except Exception: pass
         if excel:
             try: excel.Quit()
+            except Exception: pass
+        if snapshot_path:
+            try: os.remove(snapshot_path)
             except Exception: pass
     return rows
 
