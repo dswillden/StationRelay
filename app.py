@@ -254,7 +254,7 @@ def styled_button(parent, text, command, style="accent", font_key="btn", **kwarg
     colours = {
         "accent":  lambda: (T["accent"],   T["accent_fg"], T["accent_hover"]),
         "muted":   lambda: (T["surface2"], T["muted"],     T["border"]),
-        "success": lambda: ("#1e5a34",     T["success"],   "#25723f"),
+        "success": lambda: ("#1e5a34",     "#ffffff",      "#25723f"),
         "copy":    lambda: (T["surface2"], T["accent"],    T["border"]),
         "pin":     lambda: (T["tag_pending"], T["accent"], T["border"]),
     }
@@ -415,6 +415,25 @@ def _next_empty_row(sheet, col_index: int) -> int:
     return last_row + 1
 
 
+def _compute_fingerprint(wb, sheet_name: str) -> str:
+    """
+    Return a lightweight string snapshot of the sheet's current data.
+
+    Reads UsedRange row count plus the values of the first and last
+    occupied cells in columns A and D — cheap enough to poll every few
+    seconds without noticeably loading Excel.
+    """
+    try:
+        sheet = _get_sheet(wb, sheet_name)
+        used = sheet.UsedRange.Rows.Count
+        first_val = str(sheet.Cells(1, 1).Value or "")
+        last_val  = str(sheet.Cells(used, 1).Value or "")
+        last_d    = str(sheet.Cells(used, 4).Value or "")
+        return f"{used}|{first_val}|{last_val}|{last_d}"
+    except Exception:
+        return ""
+
+
 def _session_loop(excel_path: str, sheet_name: str) -> None:
     """
     Long-running function executed on the session thread.
@@ -537,6 +556,18 @@ def stop_excel_session() -> None:
     _op_queue.put(_STOP)
     _session_thread.join(timeout=5)
     _session_thread = None
+
+
+def get_sheet_fingerprint() -> str:
+    """
+    Return a lightweight hash of the live sheet's current data.
+    Returns "" if the session is not running or the call times out.
+    Used by the UI poller to detect external changes without a full read.
+    """
+    try:
+        return _run_on_session(_compute_fingerprint, timeout=5.0) or ""
+    except Exception:
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -829,8 +860,42 @@ class StationRelayApp(tk.Tk):
         sheet_name = self.config_data.get("sheet_name", "Sheet1")
         if excel_path and os.path.isfile(excel_path):
             start_excel_session(excel_path, sheet_name)
+            self._last_fingerprint = ""
+            self._start_poll()
+
+    def _start_poll(self) -> None:
+        """Begin the periodic change-detection loop (3 s interval)."""
+        self._poll_after_id: str | None = None
+        self._schedule_poll()
+
+    def _schedule_poll(self) -> None:
+        self._poll_after_id = self.after(3000, self._poll_for_changes)
+
+    def _poll_for_changes(self) -> None:
+        """
+        Run on the main thread every 3 s.
+        Posts a cheap fingerprint read to the session thread in the background;
+        if the fingerprint changed since last time, triggers a full queue reload.
+        """
+        def _worker():
+            fp = get_sheet_fingerprint()
+            self.after(0, lambda: self._check_fingerprint(fp))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _check_fingerprint(self, fp: str) -> None:
+        if fp and fp != self._last_fingerprint:
+            changed = self._last_fingerprint != ""  # skip silent first load
+            self._last_fingerprint = fp
+            if changed:
+                self._load_queue()
+        # Re-schedule regardless of whether we reloaded
+        self._schedule_poll()
 
     def _on_close(self) -> None:
+        # Cancel pending poll before destroying widgets
+        if hasattr(self, "_poll_after_id") and self._poll_after_id:
+            self.after_cancel(self._poll_after_id)
         stop_excel_session()
         self.destroy()
 
@@ -993,8 +1058,7 @@ class StationRelayApp(tk.Tk):
         self._nb.add(self._queue_outer, text="  Print Queue  ")
         self._queue_status_var = tk.StringVar(value="")
         self._queue_inner = self._build_list_tab(
-            self._queue_outer, self._queue_status_var, self._load_queue,
-            tab_name="queue")
+            self._queue_outer, self._queue_status_var, self._load_queue)
 
     # ---- Completed tab -------------------------------------------------
 
@@ -1003,15 +1067,13 @@ class StationRelayApp(tk.Tk):
         self._nb.add(self._comp_outer, text="  Completed  ")
         self._comp_status_var = tk.StringVar(value="")
         self._comp_inner = self._build_list_tab(
-            self._comp_outer, self._comp_status_var, self._load_queue,
-            tab_name="comp")
+            self._comp_outer, self._comp_status_var, self._load_queue)
 
     # ---- Shared list-tab builder ---------------------------------------
 
     def _build_list_tab(self, outer: tk.Frame,
                          status_var: tk.StringVar,
-                         refresh_cmd,
-                         tab_name: str = "queue") -> tk.Frame:
+                         refresh_cmd) -> tk.Frame:
         toolbar = tk.Frame(outer, bg=T["bg"], pady=6)
         toolbar.pack(fill=tk.X, padx=16)
         tk.Label(toolbar, textvariable=status_var,
@@ -1019,14 +1081,6 @@ class StationRelayApp(tk.Tk):
         styled_button(toolbar, "Refresh", refresh_cmd,
                       style="muted", font_key="btn_sm",
                       padx=12, pady=3).pack(side=tk.RIGHT)
-        sync_btn = styled_button(toolbar, "Sync", self._sync_and_reload,
-                                 style="success", font_key="btn_sm",
-                                 padx=12, pady=3)
-        sync_btn.pack(side=tk.RIGHT, padx=(0, 6))
-        if tab_name == "queue":
-            self._queue_sync_btn = sync_btn
-        else:
-            self._comp_sync_btn = sync_btn
 
         hdr = tk.Frame(outer, bg=T["surface2"], padx=14, pady=5)
         hdr.pack(fill=tk.X, padx=16)
@@ -1081,6 +1135,9 @@ class StationRelayApp(tk.Tk):
         self._full_rebuild()
 
     def _full_rebuild(self):
+        # Cancel poll before widgets are destroyed; _start_session_if_configured restarts it
+        if hasattr(self, "_poll_after_id") and self._poll_after_id:
+            self.after_cancel(self._poll_after_id)
         self.configure(bg=T["bg"])
         for w in self.winfo_children():
             w.destroy()
@@ -1175,56 +1232,6 @@ class StationRelayApp(tk.Tk):
         tab = self._nb.tab(self._nb.select(), "text").strip()
         if tab in ("Print Queue", "Completed"):
             self._load_queue()
-
-    # ------------------------------------------------------------------
-    # Sync (force OneDrive pull → reload)
-    # ------------------------------------------------------------------
-
-    def _sync_and_reload(self):
-        """
-        Force OneDrive to pull the latest version of the workbook from the
-        cloud, then reload the queue.
-
-        Strategy (same as _nudge_onedrive but synchronous in the worker):
-          1. Run a hidden PowerShell that opens Excel via normal COM Dispatch,
-             saves, and closes — OneDrive treats this as a user edit and
-             both uploads *and* pulls the latest cloud version first.
-          2. On completion, call _load_queue() on the main thread.
-
-        The Sync button is disabled with "Syncing…" text for the duration.
-        """
-        import subprocess
-
-        excel_path = self.config_data.get("excel_path", "").strip()
-        if not excel_path or not os.path.isfile(excel_path):
-            self._queue_status_var.set("No Excel file — open ⚙ Settings.")
-            self._comp_status_var.set("No Excel file — open ⚙ Settings.")
-            return
-
-        # Disable both sync buttons while the operation runs
-        for btn in (self._queue_sync_btn, self._comp_sync_btn):
-            btn.config(state=tk.DISABLED, text="Syncing…")
-
-        self._queue_status_var.set("Syncing with OneDrive…")
-        self._comp_status_var.set("Syncing with OneDrive…")
-
-        def _worker() -> None:
-            try:
-                # Save through the live session — OneDrive sees it immediately
-                def _save(wb, _sheet_name):
-                    wb.Save()
-                _run_on_session(_save)
-            except Exception:
-                pass
-            self.after(0, self._sync_done)
-
-        threading.Thread(target=_worker, daemon=True).start()
-
-    def _sync_done(self) -> None:
-        """Re-enable sync buttons and trigger a fresh queue load."""
-        for btn in (self._queue_sync_btn, self._comp_sync_btn):
-            btn.config(state=tk.NORMAL, text="Sync")
-        self._load_queue()
 
     def _load_queue(self):
         excel_path = self.config_data.get("excel_path", "").strip()
