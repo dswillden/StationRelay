@@ -23,15 +23,11 @@ Build single EXE:
 
 import json
 import os
-import shutil
-import tempfile
+import queue
 import threading
 import tkinter as tk
 from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
-
-
-_EXCEL_SESSION_LOCK = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Config
@@ -372,62 +368,23 @@ def get_display_name() -> str:
     return os.environ.get("USERNAME") or os.getlogin()
 
 
-def _open_excel_hidden(
-    excel_path: str,
-    read_only: bool = False,
-    kill_conflicts: bool = True,
-):
-    """Open *excel_path* in a fresh hidden Excel instance.
+# ---------------------------------------------------------------------------
+# Persistent Excel session
+# ---------------------------------------------------------------------------
+# All COM calls run on a single dedicated background thread (_session_thread).
+# That thread calls CoInitialize once, opens the workbook visibly (minimized),
+# and keeps it open for the lifetime of the app.  Work items are posted to
+# _op_queue as (callable, result_event, result_holder) tuples.
+#
+# Because every operation runs on the same thread that owns the COM objects,
+# there are no cross-thread COM calls and no need for CoMarshalInterThreadInterfaceInStream.
+# ---------------------------------------------------------------------------
 
-    Kills any existing Excel process holding the file first to avoid
-    write-lock conflicts.
-    """
-    if kill_conflicts:
-        _kill_excel_for_file(excel_path)
-    import win32com.client  # type: ignore
-    excel = win32com.client.DispatchEx("Excel.Application")
-    excel.Visible = False
-    excel.DisplayAlerts = False
-    try:
-        wb = excel.Workbooks.Open(
-            excel_path,
-            UpdateLinks=0,
-            ReadOnly=read_only,
-            IgnoreReadOnlyRecommended=True,
-            Notify=False,
-            AddToMru=False,
-        )
-    except Exception:
-        try:
-            excel.Quit()
-        except Exception:
-            pass
-        raise
-    return excel, wb
+_op_queue: queue.Queue = queue.Queue()
+_session_thread: threading.Thread | None = None
 
-
-def _create_excel_snapshot(excel_path: str) -> str:
-    """Copy the workbook to a temp file for read-only queue loading."""
-    import time
-
-    _, ext = os.path.splitext(excel_path)
-    fd, temp_path = tempfile.mkstemp(prefix="stationrelay-", suffix=ext)
-    os.close(fd)
-
-    last_exc = None
-    for _attempt in range(3):
-        try:
-            shutil.copy2(excel_path, temp_path)
-            return temp_path
-        except Exception as exc:
-            last_exc = exc
-            time.sleep(0.75)
-
-    try:
-        os.remove(temp_path)
-    except Exception:
-        pass
-    raise last_exc  # type: ignore[misc]
+# Sentinel posted to _op_queue to ask the session thread to shut down cleanly.
+_STOP = object()
 
 
 def _get_sheet(wb, sheet_name: str):
@@ -458,298 +415,197 @@ def _next_empty_row(sheet, col_index: int) -> int:
     return last_row + 1
 
 
-def _nudge_onedrive(file_path: str) -> None:
+def _session_loop(excel_path: str, sheet_name: str) -> None:
     """
-    Force OneDrive to notice and upload a change to *file_path*.
+    Long-running function executed on the session thread.
 
-    Strategy: launch a hidden PowerShell process that opens the workbook
-    in a *registered* Excel COM session (not DispatchEx), re-saves it, and
-    closes it.  This is the same as the user pressing Ctrl+S — OneDrive's
-    file-system watcher sees a real write and starts uploading immediately.
-
-    Runs as a fire-and-forget background thread so it never blocks the UI.
-    Falls back to a simple os.utime touch if PowerShell/Excel is unavailable.
+    Opens Excel visibly (minimized) and processes COM operations from
+    _op_queue until the _STOP sentinel is received or the thread is
+    interrupted.
     """
-    import subprocess
-    import threading as _threading
+    import pythoncom       # type: ignore
+    import win32com.client # type: ignore
 
-    abs_path = os.path.normpath(os.path.abspath(file_path))
+    pythoncom.CoInitialize()
+    excel = None
+    wb = None
 
-    # PowerShell script: open Excel invisibly via normal Dispatch (uses the
-    # running Excel registration so OneDrive sees it as a user edit), save,
-    # close, quit.  We use Start-Sleep to give Excel a moment to register
-    # the workbook before saving.
-    ps_script = f"""
-$ErrorActionPreference = 'Stop'
-try {{
-    $xl = New-Object -ComObject Excel.Application
-    $xl.Visible = $false
-    $xl.DisplayAlerts = $false
-    $wb = $xl.Workbooks.Open('{abs_path.replace("'", "''")}', 0, $false)
-    Start-Sleep -Milliseconds 800
-    $wb.Save()
-    $wb.Close($false)
-    $xl.Quit()
-    [System.Runtime.Interopservices.Marshal]::ReleaseComObject($xl) | Out-Null
-}} catch {{
-    exit 1
-}}
-"""
-
-    def _run() -> None:
-        import tempfile
-        # Acquire the same lock as _com_session so we don't race with a
-        # concurrent write session that already has Excel open.
-        tmp = None
+    def _ensure_open() -> None:
+        """(Re-)open the workbook if Excel or the workbook is gone."""
+        nonlocal excel, wb
+        # Check if workbook is still alive
         try:
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".ps1", delete=False, encoding="utf-8"
-            ) as f:
-                f.write(ps_script)
-                tmp = f.name
+            if wb is not None:
+                _ = wb.Name  # will throw if workbook was closed externally
+                return        # still alive — nothing to do
         except Exception:
-            return
+            wb = None
 
-        with _EXCEL_SESSION_LOCK:
-            try:
-                subprocess.run(
-                    [
-                        "powershell",
-                        "-NonInteractive",
-                        "-NoProfile",
-                        "-WindowStyle", "Hidden",
-                        "-ExecutionPolicy", "Bypass",
-                        "-File", tmp,
-                    ],
-                    timeout=30,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            except Exception:
-                # Fallback: bare timestamp touch
-                try:
-                    now = datetime.now().timestamp()
-                    os.utime(abs_path, (now, now))
-                except Exception:
-                    pass
-            finally:
-                try:
-                    os.unlink(tmp)
-                except Exception:
-                    pass
+        # Excel instance gone or workbook closed — kill stale processes first
+        _kill_excel_for_file(excel_path)
 
-    _threading.Thread(target=_run, daemon=True).start()
+        if excel is None:
+            excel = win32com.client.DispatchEx("Excel.Application")
 
+        excel.DisplayAlerts = False
+        excel.Visible = True
+        # xlMinimized = -4140
+        excel.WindowState = -4140
 
-def _com_session(func):
-    """
-    Decorator that wraps a function in a COM-initialized thread context.
-
-    Also installs a RetryMessageFilter for the duration of the call so that
-    RPC_E_CALL_REJECTED (0x80010001 — "Call was rejected by callee") errors
-    from a busy Excel instance are automatically retried by the COM runtime
-    rather than immediately raised.
-    """
-    def wrapper(*args, **kwargs):
-        import pythoncom  # type: ignore
-        with _EXCEL_SESSION_LOCK:
-            pythoncom.CoInitialize()
-            _filter = _RetryMessageFilter()
-            _filter.register()
-            try:
-                return func(*args, **kwargs)
-            finally:
-                _filter.unregister()
-                pythoncom.CoUninitialize()
-    return wrapper
-
-
-class _RetryMessageFilter:
-    """
-    COM IMessageFilter implementation that tells the RPC runtime to
-    retry calls automatically when Excel (or any COM server) is busy.
-
-    Without this, a busy Excel throws RPC_E_CALL_REJECTED immediately.
-    With this, the runtime retries for up to RETRY_MS milliseconds.
-    """
-
-    RETRY_MS = 10_000  # retry for up to 10 seconds
-
-    def register(self) -> None:
+        wb = excel.Workbooks.Open(
+            excel_path,
+            UpdateLinks=0,
+            ReadOnly=False,
+            IgnoreReadOnlyRecommended=True,
+            Notify=False,
+            AddToMru=False,
+        )
+        # Keep the workbook window minimized too
         try:
-            import pythoncom      # type: ignore
-            import win32com.server.util  # type: ignore
-
-            _retry_ms = self.RETRY_MS
-
-            class _Filter:
-                def HandleInComingCall(self, dwCallType, hTaskCaller,
-                                       dwTickCount, lpInterfaceInfo):
-                    return 0  # SERVERCALL_ISHANDLED
-
-                def RetryRejectedCall(self, hTaskCallee, dwTickCount,
-                                      dwRejectType):
-                    if dwTickCount < _retry_ms:
-                        return 100  # retry after 100 ms
-                    return -1  # cancel
-
-                def MessagePending(self, hTaskCallee, dwTickCount,
-                                   dwPendingType):
-                    return 2  # PENDINGMSG_WAITNOPROCESS
-
-            com_filter = win32com.server.util.wrap(  # type: ignore[attr-defined]
-                _Filter(),
-                pythoncom.IID_IMessageFilter,        # type: ignore[attr-defined]
-            )
-            self._prev = pythoncom.CoRegisterMessageFilter(com_filter)  # type: ignore[attr-defined]
-        except Exception:
-            self._prev = None
-
-    def unregister(self) -> None:
-        try:
-            if self._prev is not None:
-                import pythoncom  # type: ignore
-                pythoncom.CoRegisterMessageFilter(self._prev)  # type: ignore[attr-defined]
+            wb.Windows(1).WindowState = -4140
         except Exception:
             pass
 
+    # Open on startup
+    try:
+        _ensure_open()
+    except Exception:
+        pass  # Will retry on first real operation
 
-def _with_retry(max_attempts: int = 3, delay: float = 1.5):
+    while True:
+        item = _op_queue.get()
+        if item is _STOP:
+            break
+
+        fn, event, holder = item
+        try:
+            _ensure_open()
+            holder["result"] = fn(wb, sheet_name)
+        except Exception as exc:
+            holder["error"] = exc
+        finally:
+            event.set()
+
+    # Shutdown: close workbook and quit Excel
+    try:
+        if wb is not None:
+            wb.Close(SaveChanges=False)
+    except Exception:
+        pass
+    try:
+        if excel is not None:
+            excel.Quit()
+    except Exception:
+        pass
+    pythoncom.CoUninitialize()
+
+
+def _run_on_session(fn, timeout: float = 30.0):
     """
-    Decorator that retries a function on exception up to *max_attempts* times,
-    waiting *delay* seconds between attempts.  Designed for COM write functions
-    where OneDrive file-lock collisions cause transient errors.
-    Re-raises the last exception if all attempts fail.
+    Post *fn(wb, sheet_name)* to the session thread, block until done,
+    and return the result (or re-raise any exception).
     """
-    import functools
-    import time
-
-    def decorator(func):
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            last_exc: Exception | None = None
-            for attempt in range(1, max_attempts + 1):
-                try:
-                    return func(*args, **kwargs)
-                except Exception as exc:
-                    last_exc = exc
-                    if attempt < max_attempts:
-                        time.sleep(delay)
-            raise last_exc  # type: ignore[misc]
-        return wrapper
-    return decorator
+    event = threading.Event()
+    holder: dict = {}
+    _op_queue.put((fn, event, holder))
+    if not event.wait(timeout):
+        raise TimeoutError("Excel operation timed out after {timeout}s")
+    if "error" in holder:
+        raise holder["error"]
+    return holder.get("result")
 
 
-@_with_retry(max_attempts=3, delay=2.5)
-@_com_session
+def start_excel_session(excel_path: str, sheet_name: str) -> None:
+    """Start the persistent Excel session thread (idempotent)."""
+    global _session_thread
+    if _session_thread is not None and _session_thread.is_alive():
+        return
+    _session_thread = threading.Thread(
+        target=_session_loop,
+        args=(excel_path, sheet_name),
+        daemon=True,
+        name="ExcelSession",
+    )
+    _session_thread.start()
+
+
+def stop_excel_session() -> None:
+    """Ask the session thread to shut down and wait up to 5 s."""
+    global _session_thread
+    if _session_thread is None or not _session_thread.is_alive():
+        return
+    _op_queue.put(_STOP)
+    _session_thread.join(timeout=5)
+    _session_thread = None
+
+
+# ---------------------------------------------------------------------------
+# Public COM functions — called from background worker threads in the UI
+# ---------------------------------------------------------------------------
+
 def append_to_excel(excel_path: str, sheet_name: str, column: str, lot: str) -> None:
     display_name = get_display_name()
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    excel = wb = None
-    try:
-        excel, wb = _open_excel_hidden(excel_path)
-        sheet = _get_sheet(wb, sheet_name)
+
+    def _op(wb, _sheet_name: str):
+        sheet = _get_sheet(wb, _sheet_name)
         col = _col_letter_to_index(column)
         row = _next_empty_row(sheet, col)
         sheet.Cells(row, col).Value     = lot
         sheet.Cells(row, col + 1).Value = display_name
         sheet.Cells(row, col + 2).Value = timestamp
         wb.Save()
-    finally:
-        if wb:
-            try: wb.Close(SaveChanges=False)
-            except Exception: pass
-        if excel:
-            try: excel.Quit()
-            except Exception: pass
-    _nudge_onedrive(excel_path)
+
+    _run_on_session(_op)
 
 
-@_with_retry(max_attempts=3, delay=2.5)
-@_com_session
 def read_from_excel(excel_path: str, sheet_name: str, column: str) -> list:
-    """
-    Read all rows from the Excel queue sheet.
-    Raises on failure — callers must handle the exception and surface it to the user.
-    """
-    excel = wb = None
-    snapshot_path = None
-    rows = []
-    try:
-        snapshot_path = _create_excel_snapshot(excel_path)
-        excel, wb = _open_excel_hidden(
-            snapshot_path,
-            read_only=True,
-            kill_conflicts=False,
-        )
-        sheet = _get_sheet(wb, sheet_name)
+    """Read all rows from the live open workbook."""
+    rows: list = []
+
+    def _op(wb, _sheet_name: str):
+        sheet = _get_sheet(wb, _sheet_name)
         col = _col_letter_to_index(column)
         used = sheet.UsedRange.Rows.Count
+        result = []
         for r in range(1, used + 1):
             val = sheet.Cells(r, col).Value
             if val is None or str(val).strip() == "":
                 continue
-            rows.append({
+            result.append({
                 "row":          r,
                 "lot":          str(val).strip(),
                 "name":         str(sheet.Cells(r, col + 1).Value or ""),
                 "submitted_at": str(sheet.Cells(r, col + 2).Value or ""),
                 "printed_at":   str(sheet.Cells(r, col + 3).Value or ""),
             })
-    finally:
-        if wb:
-            try: wb.Close(SaveChanges=False)
-            except Exception: pass
-        if excel:
-            try: excel.Quit()
-            except Exception: pass
-        if snapshot_path:
-            try: os.remove(snapshot_path)
-            except Exception: pass
-    return rows
+        return result
+
+    return _run_on_session(_op) or rows
 
 
-@_with_retry(max_attempts=3, delay=2.5)
-@_com_session
 def mark_done_in_excel(excel_path: str, sheet_name: str,
                         column: str, row_number: int) -> None:
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    excel = wb = None
-    try:
-        excel, wb = _open_excel_hidden(excel_path)
-        sheet = _get_sheet(wb, sheet_name)
+
+    def _op(wb, _sheet_name: str):
+        sheet = _get_sheet(wb, _sheet_name)
         col = _col_letter_to_index(column)
         sheet.Cells(row_number, col + 3).Value = timestamp
         wb.Save()
-    finally:
-        if wb:
-            try: wb.Close(SaveChanges=False)
-            except Exception: pass
-        if excel:
-            try: excel.Quit()
-            except Exception: pass
-    _nudge_onedrive(excel_path)
+
+    _run_on_session(_op)
 
 
-@_with_retry(max_attempts=3, delay=2.5)
-@_com_session
 def unmark_done_in_excel(excel_path: str, sheet_name: str,
                           column: str, row_number: int) -> None:
-    excel = wb = None
-    try:
-        excel, wb = _open_excel_hidden(excel_path)
-        sheet = _get_sheet(wb, sheet_name)
+    def _op(wb, _sheet_name: str):
+        sheet = _get_sheet(wb, _sheet_name)
         col = _col_letter_to_index(column)
         sheet.Cells(row_number, col + 3).Value = None
         wb.Save()
-    finally:
-        if wb:
-            try: wb.Close(SaveChanges=False)
-            except Exception: pass
-        if excel:
-            try: excel.Quit()
-            except Exception: pass
-    _nudge_onedrive(excel_path)
+
+    _run_on_session(_op)
 
 
 # ---------------------------------------------------------------------------
@@ -852,6 +708,9 @@ class SettingsDialog(tk.Toplevel):
         self.parent_app.config_data["sheet_name"] = self._sheet_var.get().strip() or "Sheet1"
         self.parent_app.config_data["column"]     = self._col_var.get().strip().upper() or "A"
         save_config(self.parent_app.config_data)
+        # Restart session so it picks up the new path/sheet
+        stop_excel_session()
+        self.parent_app._start_session_if_configured()
         self.destroy()
 
 
@@ -958,6 +817,22 @@ class StationRelayApp(tk.Tk):
         # Restore always-on-top
         if self.config_data.get("always_on_top", False):
             self.attributes("-topmost", True)
+
+        # Start persistent Excel session if a file is configured
+        self._start_session_if_configured()
+
+        # Clean shutdown
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _start_session_if_configured(self) -> None:
+        excel_path = self.config_data.get("excel_path", "").strip()
+        sheet_name = self.config_data.get("sheet_name", "Sheet1")
+        if excel_path and os.path.isfile(excel_path):
+            start_excel_session(excel_path, sheet_name)
+
+    def _on_close(self) -> None:
+        stop_excel_session()
+        self.destroy()
 
     # ------------------------------------------------------------------
     # Build UI
@@ -1333,62 +1208,14 @@ class StationRelayApp(tk.Tk):
         self._queue_status_var.set("Syncing with OneDrive…")
         self._comp_status_var.set("Syncing with OneDrive…")
 
-        abs_path = os.path.normpath(os.path.abspath(excel_path))
-
-        ps_script = f"""
-$ErrorActionPreference = 'Stop'
-try {{
-    $xl = New-Object -ComObject Excel.Application
-    $xl.Visible = $false
-    $xl.DisplayAlerts = $false
-    $wb = $xl.Workbooks.Open('{abs_path.replace("'", "''")}', 0, $false)
-    Start-Sleep -Milliseconds 800
-    $wb.Save()
-    $wb.Close($false)
-    $xl.Quit()
-    [System.Runtime.Interopservices.Marshal]::ReleaseComObject($xl) | Out-Null
-}} catch {{
-    exit 1
-}}
-"""
-
         def _worker() -> None:
-            import tempfile
-            # Write to a temp .ps1 file — avoids -Command inline parsing
-            # issues and mirrors the approach that was tested to work.
-            tmp = None
             try:
-                with tempfile.NamedTemporaryFile(
-                    mode="w", suffix=".ps1", delete=False, encoding="utf-8"
-                ) as f:
-                    f.write(ps_script)
-                    tmp = f.name
+                # Save through the live session — OneDrive sees it immediately
+                def _save(wb, _sheet_name):
+                    wb.Save()
+                _run_on_session(_save)
             except Exception:
-                self.after(0, self._sync_done)
-                return
-
-            with _EXCEL_SESSION_LOCK:
-                try:
-                    subprocess.run(
-                        [
-                            "powershell",
-                            "-NonInteractive",
-                            "-NoProfile",
-                            "-WindowStyle", "Hidden",
-                            "-ExecutionPolicy", "Bypass",
-                            "-File", tmp,
-                        ],
-                        timeout=30,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-                except Exception:
-                    pass
-                finally:
-                    try:
-                        os.unlink(tmp)
-                    except Exception:
-                        pass
+                pass
             self.after(0, self._sync_done)
 
         threading.Thread(target=_worker, daemon=True).start()
