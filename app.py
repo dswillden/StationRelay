@@ -51,11 +51,15 @@ from tkinter import filedialog, messagebox, ttk
 #      Example:  "AMER-LS-eBR Implementation-Bottling Team - Documents/BTL_QuickShare.xlsx"
 #
 BAKED_DEFAULTS: dict = {
-    "excel_path":    r"AMER-LS-eBR Implementation-Bottling Team - Documents/BTL_QuickShare.xlsx",
-    "sheet_name":    "Sheet1",
-    "column":        "A",
-    "theme":         "light",
-    "always_on_top": False,
+    "excel_path":           r"AMER-LS-eBR Implementation-Bottling Team - Documents/BTL_QuickShare.xlsx",
+    "sheet_name":           "Sheet1",
+    "column":               "A",
+    "theme":                "light",
+    "always_on_top":        False,
+    # Password used to protect the worksheet against manual edits.
+    # COM writes are always allowed regardless (UserInterfaceOnly=True).
+    # Set to "" to disable protection entirely.
+    "protection_password":  "StationRelay",
 }
 
 # Fallback if AppData is unavailable for some reason
@@ -434,13 +438,17 @@ def _compute_fingerprint(wb, sheet_name: str) -> str:
         return ""
 
 
-def _session_loop(excel_path: str, sheet_name: str) -> None:
+def _session_loop(excel_path: str, sheet_name: str, protection_password: str) -> None:
     """
     Long-running function executed on the session thread.
 
     Opens Excel visibly (minimized) and processes COM operations from
     _op_queue until the _STOP sentinel is received or the thread is
     interrupted.
+
+    After every open/re-attach, all sheets in the workbook are protected
+    with UserInterfaceOnly=True so that manual keyboard edits are blocked
+    but COM writes succeed without unprotect/protect wrappers.
     """
     import pythoncom       # type: ignore
     import win32com.client # type: ignore
@@ -449,6 +457,38 @@ def _session_loop(excel_path: str, sheet_name: str) -> None:
     excel = None
     wb = None
     _open_failed = False  # True after a failed Workbooks.Open; cleared on wb-alive check
+
+    def _apply_protection(workbook) -> None:
+        """
+        Apply UserInterfaceOnly protection to every sheet in *workbook*.
+
+        UserInterfaceOnly=True means:
+          - Keyboard / mouse edits by a human → blocked (shows "protected" message).
+          - COM writes via sheet.Cells(...).Value = ... → allowed without
+            needing an Unprotect/Protect wrapper.
+
+        IMPORTANT: Excel does NOT persist UserInterfaceOnly to disk.  It must
+        be re-applied every time the workbook is opened or re-attached.
+        """
+        if not protection_password:
+            return  # protection disabled — empty password means opt-out
+        try:
+            for sh in workbook.Sheets:
+                try:
+                    # Unprotect first in case it was already protected with a
+                    # different flag (e.g. saved while protected without UIO).
+                    sh.Unprotect(protection_password)
+                except Exception:
+                    pass  # Not protected, or wrong password — proceed anyway
+                sh.Protect(
+                    Password=protection_password,
+                    DrawingObjects=True,
+                    Contents=True,
+                    Scenarios=True,
+                    UserInterfaceOnly=True,  # ← key: COM writes bypass protection
+                )
+        except Exception:
+            pass  # Never let a protection error break the session
 
     def _find_existing_excel():
         """
@@ -494,6 +534,10 @@ def _session_loop(excel_path: str, sheet_name: str) -> None:
             if wb is not None:
                 _ = wb.Name  # will throw if workbook was closed externally
                 _open_failed = False  # it's alive — clear any prior failure
+                # Re-apply protection: UserInterfaceOnly is not persisted by
+                # Excel, so if the workbook was closed and reopened externally
+                # the flag is gone.  Re-applying is cheap and idempotent.
+                _apply_protection(wb)
                 return
         except Exception:
             wb = None
@@ -517,6 +561,7 @@ def _session_loop(excel_path: str, sheet_name: str) -> None:
                 excel.WindowState = -4140  # xlMinimized
             except Exception:
                 pass
+            _apply_protection(wb)
             return
 
         # Spawn a fresh Excel instance (DispatchEx always creates a new process)
@@ -552,6 +597,7 @@ def _session_loop(excel_path: str, sheet_name: str) -> None:
             wb.Windows(1).WindowState = -4140
         except Exception:
             pass
+        _apply_protection(wb)
 
     # Open on startup
     try:
@@ -602,14 +648,14 @@ def _run_on_session(fn, timeout: float = 30.0):
     return holder.get("result")
 
 
-def start_excel_session(excel_path: str, sheet_name: str) -> None:
+def start_excel_session(excel_path: str, sheet_name: str, protection_password: str = "") -> None:
     """Start the persistent Excel session thread (idempotent)."""
     global _session_thread
     if _session_thread is not None and _session_thread.is_alive():
         return
     _session_thread = threading.Thread(
         target=_session_loop,
-        args=(excel_path, sheet_name),
+        args=(excel_path, sheet_name, protection_password),
         daemon=True,
         name="ExcelSession",
     )
@@ -926,8 +972,9 @@ class StationRelayApp(tk.Tk):
     def _start_session_if_configured(self) -> None:
         excel_path = self.config_data.get("excel_path", "").strip()
         sheet_name = self.config_data.get("sheet_name", "Sheet1")
+        protection_password = self.config_data.get("protection_password", "")
         if excel_path and os.path.isfile(excel_path):
-            start_excel_session(excel_path, sheet_name)
+            start_excel_session(excel_path, sheet_name, protection_password)
             self._last_fingerprint = ""
             self._start_poll()
 
