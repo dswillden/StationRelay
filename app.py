@@ -497,8 +497,19 @@ try {{
 """
 
     def _run() -> None:
+        import tempfile
         # Acquire the same lock as _com_session so we don't race with a
         # concurrent write session that already has Excel open.
+        tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".ps1", delete=False, encoding="utf-8"
+            ) as f:
+                f.write(ps_script)
+                tmp = f.name
+        except Exception:
+            return
+
         with _EXCEL_SESSION_LOCK:
             try:
                 subprocess.run(
@@ -507,7 +518,8 @@ try {{
                         "-NonInteractive",
                         "-NoProfile",
                         "-WindowStyle", "Hidden",
-                        "-Command", ps_script,
+                        "-ExecutionPolicy", "Bypass",
+                        "-File", tmp,
                     ],
                     timeout=30,
                     stdout=subprocess.DEVNULL,
@@ -518,6 +530,11 @@ try {{
                 try:
                     now = datetime.now().timestamp()
                     os.utime(abs_path, (now, now))
+                except Exception:
+                    pass
+            finally:
+                try:
+                    os.unlink(tmp)
                 except Exception:
                     pass
 
@@ -1336,6 +1353,20 @@ try {{
 """
 
         def _worker() -> None:
+            import tempfile
+            # Write to a temp .ps1 file — avoids -Command inline parsing
+            # issues and mirrors the approach that was tested to work.
+            tmp = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w", suffix=".ps1", delete=False, encoding="utf-8"
+                ) as f:
+                    f.write(ps_script)
+                    tmp = f.name
+            except Exception:
+                self.after(0, self._sync_done)
+                return
+
             with _EXCEL_SESSION_LOCK:
                 try:
                     subprocess.run(
@@ -1344,7 +1375,8 @@ try {{
                             "-NonInteractive",
                             "-NoProfile",
                             "-WindowStyle", "Hidden",
-                            "-Command", ps_script,
+                            "-ExecutionPolicy", "Bypass",
+                            "-File", tmp,
                         ],
                         timeout=30,
                         stdout=subprocess.DEVNULL,
@@ -1352,6 +1384,11 @@ try {{
                     )
                 except Exception:
                     pass
+                finally:
+                    try:
+                        os.unlink(tmp)
+                    except Exception:
+                        pass
             self.after(0, self._sync_done)
 
         threading.Thread(target=_worker, daemon=True).start()
