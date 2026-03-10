@@ -450,7 +450,7 @@ def _session_loop(excel_path: str, sheet_name: str) -> None:
     wb = None
 
     def _ensure_open() -> None:
-        """(Re-)open the workbook if Excel or the workbook is gone."""
+        """(Re-)open the workbook if the workbook reference has gone stale."""
         nonlocal excel, wb
         # Check if workbook is still alive
         try:
@@ -459,13 +459,11 @@ def _session_loop(excel_path: str, sheet_name: str) -> None:
                 return        # still alive — nothing to do
         except Exception:
             wb = None
+            # The excel instance may also be dead; reset it so we spawn fresh
+            excel = None
 
-        # Excel instance gone or workbook closed — kill stale processes first
-        _kill_excel_for_file(excel_path)
-
-        if excel is None:
-            excel = win32com.client.DispatchEx("Excel.Application")
-
+        # Spawn a fresh Excel instance (DispatchEx always creates a new process)
+        excel = win32com.client.DispatchEx("Excel.Application")
         excel.DisplayAlerts = False
         excel.Visible = True
         # xlMinimized = -4140
