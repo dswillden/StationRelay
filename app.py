@@ -1101,7 +1101,8 @@ class StationRelayApp(tk.Tk):
         self._nb.add(self._queue_outer, text="  Print Queue  ")
         self._queue_status_var = tk.StringVar(value="")
         self._queue_inner = self._build_list_tab(
-            self._queue_outer, self._queue_status_var, self._load_queue)
+            self._queue_outer, self._queue_status_var, self._load_queue,
+            tab_name="queue")
 
     # ---- Completed tab -------------------------------------------------
 
@@ -1110,13 +1111,15 @@ class StationRelayApp(tk.Tk):
         self._nb.add(self._comp_outer, text="  Completed  ")
         self._comp_status_var = tk.StringVar(value="")
         self._comp_inner = self._build_list_tab(
-            self._comp_outer, self._comp_status_var, self._load_queue)
+            self._comp_outer, self._comp_status_var, self._load_queue,
+            tab_name="comp")
 
     # ---- Shared list-tab builder ---------------------------------------
 
     def _build_list_tab(self, outer: tk.Frame,
                          status_var: tk.StringVar,
-                         refresh_cmd) -> tk.Frame:
+                         refresh_cmd,
+                         tab_name: str = "queue") -> tk.Frame:
         toolbar = tk.Frame(outer, bg=T["bg"], pady=6)
         toolbar.pack(fill=tk.X, padx=16)
         tk.Label(toolbar, textvariable=status_var,
@@ -1124,6 +1127,14 @@ class StationRelayApp(tk.Tk):
         styled_button(toolbar, "Refresh", refresh_cmd,
                       style="muted", font_key="btn_sm",
                       padx=12, pady=3).pack(side=tk.RIGHT)
+        sync_btn = styled_button(toolbar, "Sync", self._sync_and_reload,
+                                 style="success", font_key="btn_sm",
+                                 padx=12, pady=3)
+        sync_btn.pack(side=tk.RIGHT, padx=(0, 6))
+        if tab_name == "queue":
+            self._queue_sync_btn = sync_btn
+        else:
+            self._comp_sync_btn = sync_btn
 
         hdr = tk.Frame(outer, bg=T["surface2"], padx=14, pady=5)
         hdr.pack(fill=tk.X, padx=16)
@@ -1272,6 +1283,84 @@ class StationRelayApp(tk.Tk):
         tab = self._nb.tab(self._nb.select(), "text").strip()
         if tab in ("Print Queue", "Completed"):
             self._load_queue()
+
+    # ------------------------------------------------------------------
+    # Sync (force OneDrive pull → reload)
+    # ------------------------------------------------------------------
+
+    def _sync_and_reload(self):
+        """
+        Force OneDrive to pull the latest version of the workbook from the
+        cloud, then reload the queue.
+
+        Strategy (same as _nudge_onedrive but synchronous in the worker):
+          1. Run a hidden PowerShell that opens Excel via normal COM Dispatch,
+             saves, and closes — OneDrive treats this as a user edit and
+             both uploads *and* pulls the latest cloud version first.
+          2. On completion, call _load_queue() on the main thread.
+
+        The Sync button is disabled with "Syncing…" text for the duration.
+        """
+        import subprocess
+
+        excel_path = self.config_data.get("excel_path", "").strip()
+        if not excel_path or not os.path.isfile(excel_path):
+            self._queue_status_var.set("No Excel file — open ⚙ Settings.")
+            self._comp_status_var.set("No Excel file — open ⚙ Settings.")
+            return
+
+        # Disable both sync buttons while the operation runs
+        for btn in (self._queue_sync_btn, self._comp_sync_btn):
+            btn.config(state=tk.DISABLED, text="Syncing…")
+
+        self._queue_status_var.set("Syncing with OneDrive…")
+        self._comp_status_var.set("Syncing with OneDrive…")
+
+        abs_path = os.path.normpath(os.path.abspath(excel_path))
+
+        ps_script = f"""
+$ErrorActionPreference = 'Stop'
+try {{
+    $xl = New-Object -ComObject Excel.Application
+    $xl.Visible = $false
+    $xl.DisplayAlerts = $false
+    $wb = $xl.Workbooks.Open('{abs_path.replace("'", "''")}', 0, $false)
+    Start-Sleep -Milliseconds 800
+    $wb.Save()
+    $wb.Close($false)
+    $xl.Quit()
+    [System.Runtime.Interopservices.Marshal]::ReleaseComObject($xl) | Out-Null
+}} catch {{
+    exit 1
+}}
+"""
+
+        def _worker() -> None:
+            with _EXCEL_SESSION_LOCK:
+                try:
+                    subprocess.run(
+                        [
+                            "powershell",
+                            "-NonInteractive",
+                            "-NoProfile",
+                            "-WindowStyle", "Hidden",
+                            "-Command", ps_script,
+                        ],
+                        timeout=30,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                except Exception:
+                    pass
+            self.after(0, self._sync_done)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _sync_done(self) -> None:
+        """Re-enable sync buttons and trigger a fresh queue load."""
+        for btn in (self._queue_sync_btn, self._comp_sync_btn):
+            btn.config(state=tk.NORMAL, text="Sync")
+        self._load_queue()
 
     def _load_queue(self):
         excel_path = self.config_data.get("excel_path", "").strip()
