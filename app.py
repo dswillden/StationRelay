@@ -448,35 +448,105 @@ def _session_loop(excel_path: str, sheet_name: str) -> None:
     pythoncom.CoInitialize()
     excel = None
     wb = None
+    _open_failed = False  # True after a failed Workbooks.Open; cleared on wb-alive check
+
+    def _find_existing_excel():
+        """
+        Scan running Excel instances via the Running Object Table and return
+        (excel_app, workbook) if the target file is already open, else
+        return (None, None).
+        """
+        import pythoncom       # type: ignore
+        import win32com.client # type: ignore
+        import win32com.server.util  # type: ignore
+        try:
+            context = pythoncom.CreateBindCtx(0)
+            rot = pythoncom.GetRunningObjectTable()
+            enum = rot.EnumRunning()
+            norm_target = os.path.normcase(os.path.normpath(excel_path))
+            while True:
+                # IEnumMoniker.Next(n) returns a tuple of up to n monikers
+                batch = enum.Next(1)
+                if not batch:
+                    break
+                moniker = batch[0]
+                try:
+                    display = moniker.GetDisplayName(context, None)
+                    if os.path.normcase(os.path.normpath(display)) == norm_target:
+                        obj = rot.GetObject(moniker)
+                        wbook = win32com.client.Dispatch(
+                            obj.QueryInterface(pythoncom.IID_IDispatch)
+                        )
+                        app = wbook.Application
+                        return app, wbook
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return None, None
 
     def _ensure_open() -> None:
         """(Re-)open the workbook if the workbook reference has gone stale."""
-        nonlocal excel, wb
+        nonlocal excel, wb, _open_failed
+
         # Check if workbook is still alive
         try:
             if wb is not None:
                 _ = wb.Name  # will throw if workbook was closed externally
-                return        # still alive — nothing to do
+                _open_failed = False  # it's alive — clear any prior failure
+                return
         except Exception:
             wb = None
-            # The excel instance may also be dead; reset it so we spawn fresh
             excel = None
 
-        # Spawn a fresh Excel instance (DispatchEx always creates a new process)
-        excel = win32com.client.DispatchEx("Excel.Application")
-        excel.DisplayAlerts = False
-        excel.Visible = True
-        # xlMinimized = -4140
-        excel.WindowState = -4140
+        # If we already failed to open (bad path / locked file), don't keep
+        # spawning new Excel processes on every queued item.
+        if _open_failed:
+            raise RuntimeError(
+                f"Excel workbook could not be opened (previous attempt failed): {excel_path}"
+            )
 
-        wb = excel.Workbooks.Open(
-            excel_path,
-            UpdateLinks=0,
-            ReadOnly=False,
-            IgnoreReadOnlyRecommended=True,
-            Notify=False,
-            AddToMru=False,
-        )
+        # Before spawning a brand-new process, check whether this workbook is
+        # already open in a running Excel instance (e.g. from a prior crash).
+        existing_app, existing_wb = _find_existing_excel()
+        if existing_wb is not None:
+            excel = existing_app
+            wb = existing_wb
+            try:
+                excel.Visible = True
+                excel.WindowState = -4140  # xlMinimized
+            except Exception:
+                pass
+            return
+
+        # Spawn a fresh Excel instance (DispatchEx always creates a new process)
+        new_excel = win32com.client.DispatchEx("Excel.Application")
+        new_excel.DisplayAlerts = False
+        new_excel.Visible = True
+        # xlMinimized = -4140
+        new_excel.WindowState = -4140
+
+        try:
+            new_wb = new_excel.Workbooks.Open(
+                excel_path,
+                UpdateLinks=0,
+                ReadOnly=False,
+                IgnoreReadOnlyRecommended=True,
+                Notify=False,
+                AddToMru=False,
+            )
+        except Exception:
+            # File not found, path wrong, locked, etc.
+            # Quit the orphaned Excel process we just spawned, then bail out.
+            _open_failed = True
+            try:
+                new_excel.Quit()
+            except Exception:
+                pass
+            raise
+
+        excel = new_excel
+        wb = new_wb
         # Keep the workbook window minimized too
         try:
             wb.Windows(1).WindowState = -4140
@@ -487,7 +557,7 @@ def _session_loop(excel_path: str, sheet_name: str) -> None:
     try:
         _ensure_open()
     except Exception:
-        pass  # Will retry on first real operation
+        pass  # _open_failed is set; poller will get "" and reschedule gracefully
 
     while True:
         item = _op_queue.get()
@@ -887,8 +957,10 @@ class StationRelayApp(tk.Tk):
             self._last_fingerprint = fp
             if changed:
                 self._load_queue()
-        # Re-schedule regardless of whether we reloaded
-        self._schedule_poll()
+        # Only re-schedule while the session thread is alive; if the thread
+        # died (e.g. bad path killed it), stop hammering the queue.
+        if _session_thread is not None and _session_thread.is_alive():
+            self._schedule_poll()
 
     def _on_close(self) -> None:
         # Cancel pending poll before destroying widgets
